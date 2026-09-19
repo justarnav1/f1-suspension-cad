@@ -1,0 +1,889 @@
+# FLCornerV1 -- original single-seater front-left suspension concept.
+# Run inside Autodesk Fusion: Utilities > Scripts and Add-Ins > Scripts.
+# No third-party Python packages. Engineering math: m, N, kg, rad.
+# Fusion geometry API: cm. User-facing length parameters: mm.
+# Editing fl_* parameters and running again creates a NEW updated design.
+# Existing designs are never deleted. Not a fabrication/track-use release.
+
+import math
+import os
+import csv
+import traceback
+import adsk.core
+import adsk.fusion
+
+FORCE_DEFAULTS = False
+CREATE_NATIVE_JOINTS = True
+TRANSLUCENT_TYRE = True
+TRY_HELICAL_SWEEP = True
+TAG = 'FLCornerV1'
+X, Y, Z = (1., 0., 0.), (0., 1., 0.), (0., 0., 1.)
+WARNINGS = []
+
+
+def mm(v): return v / 1000.0
+
+def add(a, b): return tuple(a[i] + b[i] for i in range(3))
+
+def sub(a, b): return tuple(a[i] - b[i] for i in range(3))
+
+def mul(a, s): return tuple(v * s for v in a)
+
+def dot(a, b): return sum(a[i] * b[i] for i in range(3))
+
+def cross(a, b):
+    return (a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2],
+            a[0]*b[1]-a[1]*b[0])
+
+def norm(a): return math.sqrt(dot(a, a))
+
+def unit(a):
+    n = norm(a)
+    if n < 1e-12: raise ValueError('Zero-length direction or coincident points.')
+    return mul(a, 1/n)
+
+def mid(a, b): return mul(add(a, b), .5)
+
+def distance(a, b): return norm(sub(a, b))
+
+def off(p, axis, length): return add(p, mul(axis, length))
+
+def perpendicular(a):
+    return unit(cross(a, X if abs(dot(unit(a), X)) < .8 else Y))
+
+def rotate(v, axis, angle):
+    a = unit(axis); c = math.cos(angle); s = math.sin(angle)
+    return add(add(mul(v, c), mul(cross(a, v), s)),
+               mul(a, dot(a, v)*(1-c)))
+
+def rotvec(v, r):
+    a = norm(r)
+    return rotate(v, r, a) if a > 1e-14 else v
+
+def point(p): return adsk.core.Point3D.create(*(100*x for x in p))
+
+def vector(v): return adsk.core.Vector3D.create(*v)
+
+
+def parameter_spec():
+    # name, Fusion expression, UI units, description.
+    s = [
+        ('wheel_radius', '340 mm', 'mm', 'Unloaded geometric tyre radius.'),
+        ('tyre_width', '280 mm', 'mm', 'Simplified tyre envelope width.'),
+        ('track', '1900 mm', 'mm', 'Static wheel-centre track.'),
+        ('wheelbase', '3600 mm', 'mm', 'Vehicle assumption; front corner only.'),
+        ('ride_height', '55 mm', 'mm', 'Chassis reference datum above ground.'),
+        ('travel', '20 mm', 'mm', 'Maximum travel in EACH direction.'),
+        ('bump', '0 mm', 'mm', 'Positive = wheel compression; rerun to rebuild.'),
+        ('camber', '-2 deg', 'deg', 'Negative = wheel top inward.'),
+        ('caster', '6 deg', 'deg', 'Positive = upper steering pivot rearward.'),
+        ('toe', '0.05 deg', 'deg', 'Positive = left-wheel toe-in.'),
+        ('mass_kg', '800', '', 'Vehicle plus driver mass, kg.'),
+        ('front_fraction', '0.45', '', 'Static front weight fraction.'),
+        ('unsprung_kg', '30', '', 'Assumed unsprung mass per front corner, kg.'),
+        ('cg_height', '300 mm', 'mm', 'Assumption for first-order anti-dive.'),
+        ('front_brake_fraction', '0.60', '', 'Assumed front braking fraction.'),
+        ('spring_N_per_mm', '220', '', 'Spring rate in N/mm, not a length.'),
+        ('spring_mean_diameter', '54 mm', 'mm', 'Coil mean diameter.'),
+        ('spring_turns', '6', '', 'Active spring turns; end rings also represented.'),
+        ('damper_length', '255 mm', 'mm', 'Static eye-to-eye length.'),
+        ('damper_stroke', '60 mm', 'mm', 'Stroke, centred about static length.'),
+        ('mr_target', '0.67', '', 'Approximate lever-sizing input, not forced MR.'),
+        ('rocker_in_y', '35 mm', 'mm', 'Input lever Y offset from pivot.'),
+        ('rocker_in_z', '60 mm', 'mm', 'Input lever Z offset from pivot.'),
+        ('rocker_out_y', '-30 mm', 'mm', 'Output lever Y offset from pivot.'),
+        ('rocker_out_z', '90 mm * fl_mr_target / 0.67', 'mm',
+         'Output lever Z offset; change dimensions to tune actual MR.'),
+        ('upper_OD', '22 mm', 'mm', 'Steel upper-arm tube outside diameter.'),
+        ('upper_wall', '1.5 mm', 'mm', 'Upper tube wall.'),
+        ('lower_OD', '26 mm', 'mm', 'Steel lower-arm tube outside diameter.'),
+        ('lower_wall', '2 mm', 'mm', 'Lower tube wall.'),
+        ('pushrod_OD', '20 mm', 'mm', 'Steel pushrod outside diameter.'),
+        ('pushrod_wall', '2 mm', 'mm', 'Pushrod tube wall.'),
+        ('tie_OD', '16 mm', 'mm', 'Steering link outside diameter.'),
+        ('tie_wall', '2 mm', 'mm', 'Steering link wall.'),
+        ('rim_radius', '228.6 mm', 'mm', '18-inch nominal bead-seat radius.'),
+        ('rim_inside', '224.6 mm', 'mm', 'Simplified barrel clear radius.'),
+        ('rim_width', '250 mm', 'mm', 'Simplified rim axial width.'),
+    ]
+    hp = {
+        'W': ('0 mm', 'fl_track/2', 'fl_wheel_radius'),
+        'UF': ('220 mm', '330 mm', 'fl_ride_height + 360.6 mm'),
+        'UR': ('-220 mm', '330 mm', 'fl_ride_height + 369.4 mm'),
+        'LF': ('300 mm', '310 mm', 'fl_ride_height + 144 mm'),
+        'LR': ('-300 mm', '310 mm', 'fl_ride_height + 156 mm'),
+        'L': ('14 mm', 'fl_W_y - 55 mm', 'fl_W_z - 130 mm'),
+        'U': ('fl_L_x - (fl_U_z-fl_L_z)*tan(fl_caster)',
+              'fl_W_y - 105 mm', 'fl_W_z + 125 mm'),
+        'T': ('fl_W_x - 115 mm', 'fl_W_y - 80 mm', 'fl_W_z'),
+        'TI': ('-135 mm', '330 mm', 'fl_ride_height + 259.25 mm'),
+        'P': ('fl_W_x + 52 mm', 'fl_W_y - 88 mm', 'fl_W_z - 65 mm'),
+        'RP': ('60 mm', '300 mm', 'fl_ride_height + 465 mm'),
+        'RI': ('fl_RP_x', 'fl_RP_y + fl_rocker_in_y',
+               'fl_RP_z + fl_rocker_in_z'),
+        'RO': ('fl_RP_x', 'fl_RP_y + fl_rocker_out_y',
+               'fl_RP_z + fl_rocker_out_z'),
+        'D': ('fl_RO_x', 'fl_RO_y - fl_damper_length', 'fl_RO_z'),
+    }
+    for key, exprs in hp.items():
+        for axis, expression in zip('xyz', exprs):
+            s.append((key+'_'+axis, expression, 'mm', key+' hard point; '+axis.upper()))
+    return s
+
+
+def read_parameters(app):
+    previous = {}
+    active = adsk.fusion.Design.cast(app.activeProduct)
+    if (not FORCE_DEFAULTS and active and
+            active.rootComponent.attributes.itemByName(TAG, 'generator')):
+        for name, expression, units, comment in parameter_spec():
+            par = active.userParameters.itemByName('fl_'+name)
+            if par: previous[name] = par.expression
+    app.documents.add(adsk.core.DocumentTypes.FusionDesignDocumentType)
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    if not design: raise RuntimeError('A Fusion Design document could not be created.')
+    design.designType = adsk.fusion.DesignTypes.ParametricDesignType
+    design.fusionUnitsManager.distanceDisplayUnits = adsk.fusion.DistanceUnits.MillimeterDistanceUnits
+    design.rootComponent.name = 'FLCornerV1 - Front Left - Engineering Concept'
+    design.rootComponent.attributes.add(TAG, 'generator', '1')
+    # Allocate every name BEFORE applying expressions, avoiding forward references.
+    for name, expression, units, comment in parameter_spec():
+        design.userParameters.add('fl_'+name,
+            adsk.core.ValueInput.createByString('1 '+units if units else '1'),
+            units, comment)
+    # Resolve formulas in dependency order, including user-edited dependencies.
+    pending = list(parameter_spec())
+    for attempt in range(len(pending)+1):
+        next_pending = []
+        for name, expression, units, comment in pending:
+            try:
+                design.userParameters.itemByName('fl_'+name).expression = previous.get(name, expression)
+            except RuntimeError:
+                next_pending.append((name, expression, units, comment))
+        if not next_pending: break
+        if len(next_pending) == len(pending):
+            raise ValueError('Invalid or cyclic parameter expression: '+next_pending[0][0])
+        pending = next_pending
+    p = {}
+    for name, expression, units, comment in parameter_spec():
+        val = design.userParameters.itemByName('fl_'+name).value
+        p[name] = val*.01 if units == 'mm' else val
+    return design, p
+
+
+def hardpoints(p):
+    keys = ('W','UF','UR','LF','LR','U','L','T','TI','P','RP','RI','RO','D')
+    return {k: tuple(p[k+'_'+a] for a in 'xyz') for k in keys}
+
+
+def linear_solve(a, b):
+    n = len(b); m = [list(a[i])+[b[i]] for i in range(n)]
+    for k in range(n):
+        r = max(range(k,n), key=lambda i: abs(m[i][k]))
+        if abs(m[r][k]) < 1e-14: raise ValueError('Kinematic Jacobian is singular.')
+        m[k], m[r] = m[r], m[k]
+        pivot = m[k][k]; m[k] = [v/pivot for v in m[k]]
+        for i in range(n):
+            if i != k:
+                q = m[i][k]
+                m[i] = [m[i][j]-q*m[k][j] for j in range(n+1)]
+    return [m[i][-1] for i in range(n)]
+
+
+def solve_pose(h, bump):
+    # Six constraints: four wishbone-leg distances, tie-rod length, wheel Z.
+    pairs = (('U','UF'),('U','UR'),('L','LF'),('L','LR'),('T','TI'))
+    lengths = [distance(h[a], h[b]) for a,b in pairs]
+    def moved(v, key):
+        return add(add(h['W'], tuple(v[:3])), rotvec(sub(h[key],h['W']), v[3:]))
+    def residual(v):
+        f = [distance(moved(v,a),h[b])-lengths[i] for i,(a,b) in enumerate(pairs)]
+        return f+[v[2]-bump]
+    v = [0.,0.,bump,0.,0.,0.]
+    for iteration in range(40):
+        f = residual(v)
+        if max(abs(x) for x in f) < 1e-10: break
+        columns = []
+        for j in range(6):
+            eps = 1e-7 if j < 3 else 1e-6
+            test = v[:]; test[j] += eps; ff = residual(test)
+            columns.append([(ff[i]-f[i])/eps for i in range(6)])
+        jac = [[columns[j][i] for j in range(6)] for i in range(6)]
+        delta = linear_solve(jac, [-x for x in f])
+        old = norm(tuple(f[:3]))**2 + sum(x*x for x in f[3:])
+        scale = 1.
+        while scale > 1/256:
+            trial = [v[i]+scale*delta[i] for i in range(6)]
+            if sum(x*x for x in residual(trial)) < old: break
+            scale *= .5
+        v = trial
+    if max(abs(x) for x in residual(v)) > 1e-8:
+        raise ValueError('Suspension pose did not converge; restore valid hard points.')
+    q = dict(h)
+    for k in ('W','U','L','T','P'): q[k] = moved(v,k)
+    return q, tuple(v[3:])
+
+
+def solve_rocker(h, q):
+    arm = sub(h['RI'],h['RP']); length = distance(h['RI'],h['P'])
+    angle = 0.
+    for iteration in range(30):
+        r = rotate(arm, X, angle); end = add(h['RP'],r)
+        delta = sub(end,q['P']); ln = norm(delta)
+        err = ln-length
+        if abs(err) < 1e-11: break
+        derivative = dot(unit(delta),cross(X,r))
+        if abs(derivative) < 1e-6: raise ValueError('Pushrod/rocker is near a toggle.')
+        step = max(-.15,min(.15,err/derivative)); angle -= step
+    if abs(distance(end,q['P'])-length) > 1e-8:
+        raise ValueError('Rocker length constraint did not converge.')
+    if abs(angle) > math.radians(35): raise ValueError('Excessive rocker rotation.')
+    for k in ('RI','RO'):
+        q[k] = add(h['RP'],rotate(sub(h[k],h['RP']),X,angle))
+    return angle, distance(q['RO'],h['D'])
+
+
+def axle(p, rotation=(0.,0.,0.)):
+    c, t = -p['camber'], p['toe']
+    return rotvec((math.sin(t)*math.cos(c),math.cos(t)*math.cos(c),math.sin(c)),rotation)
+
+
+def roll_centre(h, q, radius):
+    # Front-view construction for a mirrored axle in symmetric heave, zero steer.
+    lines = []
+    for outer,a,b in (('U','UF','UR'),('L','LF','LR')):
+        axis = unit(sub(h[b],h[a])); o = q[outer]
+        inside = off(h[a],axis,dot(sub(o,h[a]),axis))
+        lines.append((o,sub(inside,o)))
+    a,v = lines[0]; b,w = lines[1]
+    t = linear_solve([[v[1],-w[1]],[v[2],-w[2]]],
+                     [b[1]-a[1],b[2]-a[2]])[0]
+    ic = off(a,v,t)
+    ground = q['W'][2]-radius
+    if abs(q['W'][1]-ic[1]) < 1e-6: raise ValueError('Undefined roll centre.')
+    return (ic[2]-ground)*q['W'][1]/(q['W'][1]-ic[1])
+
+
+def arm_shape(h, q, which):
+    a,b,o = (q[k] for k in ((which+'F'),(which+'R'),which))
+    axis = unit(sub(b,a))
+    # Short straight bearing necks avoid clevis interference at angled tube ends.
+    def neck(p, target):
+        d = sub(target,p); d = sub(d,mul(axis,dot(d,axis)))
+        return off(p,unit(d),mm(42))
+    junction = neck(o,mid(a,b))
+    af,br = neck(a,junction),neck(b,junction)
+    return a,b,o,af,br,junction,axis
+
+
+def segment_distance(a,b,c,d):
+    u,v,w = sub(b,a),sub(d,c),sub(a,c)
+    aa,bb,cc,dd,ee = dot(u,u),dot(u,v),dot(v,v),dot(u,w),dot(v,w)
+    den = aa*cc-bb*bb
+    s = max(0.,min(1.,(bb*ee-cc*dd)/den)) if den > 1e-20 else 0.
+    t = (bb*s+ee)/cc
+    if t < 0.: t=0.; s=max(0.,min(1.,-dd/aa))
+    elif t > 1.: t=1.; s=max(0.,min(1.,(bb-dd)/aa))
+    return distance(off(a,u,s),off(c,v,t))
+
+
+def validate(p,h):
+    if abs(p['bump']) > p['travel']+1e-9: raise ValueError('fl_bump exceeds +/-fl_travel.')
+    if not .15 < p['wheel_radius'] < .5: raise ValueError('Invalid wheel radius.')
+    if not 0 < p['rim_inside'] < p['rim_radius'] < p['wheel_radius']-mm(20):
+        raise ValueError('Rim/tyre radii are incompatible.')
+    if p['tyre_width'] < p['rim_width']+mm(20):
+        raise ValueError('V1 tyre must be at least 20 mm wider than the rim.')
+    if p['spring_turns'] < 2 or p['spring_N_per_mm'] <= 0:
+        raise ValueError('Invalid spring specification.')
+    for name in ('upper','lower','pushrod','tie'):
+        if not 0 < p[name+'_wall'] < p[name+'_OD']/2:
+            raise ValueError('Invalid tube wall for '+name)
+    for key in ('RI','RO','D'):
+        if abs(h[key][0]-h['RP'][0]) > 1e-6:
+            raise ValueError('V1 rocker and damper must remain in the RP YZ plane.')
+    rows = []; min_clear = float('inf'); min_barrel = float('inf')
+    spring_wire = (8*p['spring_mean_diameter']**3*p['spring_turns']*
+                   p['spring_N_per_mm']*1000/79e9)**.25
+    for i in range(9):
+        dz = -p['travel']+i*p['travel']/4
+        q,r = solve_pose(h,dz); angle,length = solve_rocker(h,q); n=axle(p,r)
+        if not mm(225) < length < mm(285):
+            raise ValueError('V1 damper packaging requires eye lengths between 225 and 285 mm.')
+        if abs(length-p['damper_length']) > p['damper_stroke']/2-mm(2):
+            raise ValueError('Damper reaches its stroke limit within specified wheel travel.')
+        if length-mm(60) < (p['spring_turns']+2)*spring_wire+mm(8):
+            raise ValueError('Insufficient spring coil-bind clearance.')
+        lines=[]
+        for which,name in (('U','upper'),('L','lower')):
+            a,b,o,af,br,j,axis=arm_shape(h,q,which)
+            lines += [(which,af,j,p[name+'_OD']/2),(which,br,j,p[name+'_OD']/2)]
+        lines += [('push',q['P'],q['RI'],p['pushrod_OD']/2),
+                  ('tie',q['TI'],q['T'],p['tie_OD']/2)]
+        for j,(name,a,b,rad) in enumerate(lines):
+            for name2,c,d,rad2 in lines[j+1:]:
+                if name != name2:
+                    min_clear=min(min_clear,segment_distance(a,b,c,d)-rad-rad2)
+            for k in range(61):
+                pt=add(a,mul(sub(b,a),k/60)); dv=sub(pt,q['W']); axial=dot(dv,n)
+                if abs(axial) <= p['rim_width']/2+rad:
+                    radial=norm(sub(dv,mul(n,axial)))
+                    min_barrel=min(min_barrel,p['rim_inside']-radial-rad)
+        rows.append((dz, -math.asin(max(-1.,min(1.,n[2]))),
+                     math.atan2(n[0],n[1]),roll_centre(h,q,p['wheel_radius']),length,angle))
+    if min_clear < mm(3): raise ValueError('Non-connected links have less than 3 mm clearance.')
+    if min_barrel < mm(5): raise ValueError('A suspension link approaches/intersects the rim barrel.')
+    dl=[]
+    for dz in (-mm(.1),mm(.1)):
+        q,r=solve_pose(h,dz); dl.append(solve_rocker(h,q)[1])
+    mr=-(dl[1]-dl[0])/mm(.2)
+    if not .2 < mr < 1.5: raise ValueError('Implausible or reversed motion ratio.')
+    mass=p['mass_kg']*p['front_fraction']/2-p['unsprung_kg']
+    if mass <= 0: raise ValueError('Invalid assumed sprung corner mass.')
+    return rows,mr,spring_wire,min_clear,min_barrel,mass
+
+
+class CAD:
+    def __init__(self, design):
+        self.design=design; self.root=design.rootComponent
+        self.tm=adsk.fusion.TemporaryBRepManager.get()
+        self.parts={}; self.styles={}; self.current=None; self.base=None; self.names=[]
+        self._styles()
+
+    def _styles(self):
+        colors={'frame':(55,62,70),'arm':(45,48,54),'alloy':(170,178,187),
+                'steel':(115,128,142),'spring':(210,43,38),'damper':(186,133,47),
+                'rubber':(25,27,30)}
+        source=None
+        try:
+            for lib in adsk.core.Application.get().materialLibraries:
+                for name in ('Paint - Enamel Glossy (Yellow)','Paint - Enamel Glossy (Black)',
+                             'Aluminum - Satin','Steel - Satin'):
+                    source=lib.appearances.itemByName(name)
+                    if source: break
+                if source: break
+            if not source: return
+            for key,rgb in colors.items():
+                ap=self.design.appearances.addByCopy(source,TAG+'_'+key)
+                for prop in ap.appearanceProperties:
+                    cp=adsk.core.ColorProperty.cast(prop)
+                    if cp:
+                        cp.value=adsk.core.Color.create(*rgb,255); break
+                self.styles[key]=ap
+        except Exception as e:
+            WARNINGS.append('Appearance library fallback: '+str(e))
+
+    def material(self, comp, names):
+        try:
+            for lib in adsk.core.Application.get().materialLibraries:
+                for name in names:
+                    mat=lib.materials.itemByName(name)
+                    if mat: comp.material=mat; return
+        except Exception:
+            pass  # Library availability must not prevent geometry creation.
+
+    def start(self,key,name,style='alloy',material=('Aluminum 6061',)):
+        self.finish()
+        occ=self.root.occurrences.addNewComponent(adsk.core.Matrix3D.create())
+        occ.component.name=name; self.parts[key]=occ; self.current=occ.component
+        try: occ.isGroundToParent=False
+        except AttributeError: pass
+        occ.isGrounded=False
+        self.material(self.current,material)
+        self.style=style; self.names=[]
+        self.base=self.current.features.baseFeatures.add(); self.base.name=name+' solids'
+        if not self.base.startEdit(): raise RuntimeError('Cannot edit BaseFeature: '+name)
+        return occ
+
+    def put(self,body,name,style=None):
+        if body is None: raise RuntimeError('Empty body: '+name)
+        out=self.current.bRepBodies.add(body,self.base)
+        if out is None: raise RuntimeError('Could not persist body: '+name)
+        out.name=name; ap=self.styles.get(style or self.style)
+        if ap: out.appearance=ap
+        self.names.append((name,style or self.style))
+        return out
+
+    def finish(self):
+        if self.base:
+            base=self.base; self.base=None
+            if not base.finishEdit(): raise RuntimeError('Could not finish BaseFeature.')
+            # Name/style the RESULT bodies, not only the editable source bodies.
+            for i,(name,style) in enumerate(self.names):
+                if i < base.bodies.count:
+                    b=base.bodies.item(i); b.name=name
+                    if style in self.styles: b.appearance=self.styles[style]
+            adsk.doEvents()
+
+    def boolean(self,a,b,op):
+        if a is None or b is None or not self.tm.booleanOperation(a,b,op):
+            raise RuntimeError('BRep Boolean operation failed; inspect edited dimensions.')
+        return a
+
+    def union(self,*bodies):
+        result=bodies[0]
+        for b in bodies[1:]: self.boolean(result,b,adsk.fusion.BooleanTypes.UnionBooleanType)
+        return result
+
+    def cut(self,a,b): return self.boolean(a,b,adsk.fusion.BooleanTypes.DifferenceBooleanType)
+
+    def intersect(self,a,b): return self.boolean(a,b,adsk.fusion.BooleanTypes.IntersectionBooleanType)
+
+    def cyl(self,a,b,r,r2=None):
+        if distance(a,b)<1e-7 or r<=0: raise ValueError('Invalid cylinder.')
+        return self.tm.createCylinderOrCone(point(a),100*r,point(b),100*(r if r2 is None else r2))
+
+    def ring(self,p,n,length,outer,inner):
+        return self.cut(self.cyl(off(p,n,-length/2),off(p,n,length/2),outer),
+                        self.cyl(off(p,n,-length/2-mm(.2)),off(p,n,length/2+mm(.2)),inner))
+
+    def sphere(self,p,r): return self.tm.createSphere(point(p),100*r)
+
+    def box(self,p,l,w,t,along=X,across=Y):
+        a=unit(along); b=unit(sub(across,mul(a,dot(across,a))))
+        bb=adsk.core.OrientedBoundingBox3D.create(point(p),vector(a),vector(b),100*l,100*w,100*t)
+        return self.tm.createBox(bb)
+
+    def capsule(self,a,b,n,width,thick):
+        d=unit(sub(b,a)); side=unit(cross(n,d))
+        return self.union(self.box(mid(a,b),distance(a,b),width,thick,d,side),
+            self.cyl(off(a,n,-thick/2),off(a,n,thick/2),width/2),
+            self.cyl(off(b,n,-thick/2),off(b,n,thick/2),width/2))
+
+    def tube(self,a,b,outer,wall):
+        d=unit(sub(b,a))
+        return self.cut(self.cyl(a,b,outer/2),
+                        self.cyl(off(a,d,-mm(.2)),off(b,d,mm(.2)),outer/2-wall))
+
+    def eye_blank(self,p,n): return self.cyl(off(p,n,-mm(7)),off(p,n,mm(7)),mm(17))
+
+    def eye_cut(self,body,p,n):
+        self.cut(body,self.sphere(p,mm(12.10)))
+        return self.cut(body,self.cyl(off(p,n,-mm(20)),off(p,n,mm(20)),mm(9)))
+
+    def ball_and_pin(self,p,n,label,half_gap=mm(9.1),pin_r=mm(4.95)):
+        ball=self.intersect(self.sphere(p,mm(12)),
+            self.box(p,mm(18),mm(30),mm(30),n,perpendicular(n)))
+        self.cut(ball,self.cyl(off(p,n,-mm(20)),off(p,n,mm(20)),mm(5.1)))
+        self.put(ball,label+' spherical inner race','steel')
+        half=half_gap+mm(8)
+        self.put(self.cyl(off(p,n,-half),off(p,n,half),pin_r),label+' pin','steel')
+        for sign in (-1,1):
+            self.put(self.ring(off(p,n,sign*(half-mm(1))),n,mm(2),mm(8),mm(5.05)),
+                     label+(' washer A' if sign<0 else ' washer B'),'steel')
+            self.put(self.cyl(off(p,n,sign*half),off(p,n,sign*(half+mm(4))),mm(8)),
+                     label+(' bolt head' if sign<0 else ' nut proxy'),'steel')
+
+    def clevis(self,p,n,back,gap=mm(18.2),width=mm(30),pin=mm(5.1)):
+        # Back vector is perpendicular to pin, leaving the bearing articulation gap.
+        d=sub(back,p); back=add(p,sub(d,mul(n,dot(d,n))))
+        ears=[]
+        for sign in (-1,1):
+            shift=mul(n,sign*(gap/2+mm(3)))
+            ear=self.capsule(add(p,shift),add(back,shift),n,width,mm(6))
+            self.cut(ear,self.cyl(off(p,n,-mm(50)),off(p,n,mm(50)),pin))
+            ears.append(ear)
+        bridge=self.cyl(off(back,n,-gap/2-mm(6)),off(back,n,gap/2+mm(6)),width/2)
+        return self.union(ears[0],bridge,ears[1]),back
+
+
+def build_chassis(c,p,h):
+    occ=c.start('chassis','01 Chassis, pickup clevises and rack proxy','frame',('Steel',))
+    y=mm(245); z0=p['ride_height']+mm(95); z1=p['ride_height']+mm(390)
+    for z in (z0,z1):
+        c.put(c.tube((mm(-360),y,z),(mm(360),y,z),mm(32),mm(2.5)), 'Longitudinal rail '+str(round(z*1000)))
+    for x in (mm(-360),mm(360)):
+        c.put(c.tube((x,y,z0),(x,y,z1),mm(32),mm(2.5)), 'End post '+str(round(x*1000)))
+    for x in (mm(-280),mm(280)):
+        c.put(c.tube((x,mm(15),z1),(x,y,z1),mm(32),mm(2.5)), 'Inboard crossmember '+str(round(x*1000)))
+    c.put(c.tube((mm(-280),mm(15),z1),(mm(280),mm(15),z1),mm(32),mm(2.5)), 'Inboard top rail')
+    for key in ('UF','UR','LF','LR','TI'):
+        pt=h[key]
+        n=unit(sub(h['UR'],h['UF'])) if key[0]=='U' else (
+          unit(sub(h['LR'],h['LF'])) if key[0]=='L' else X)
+        bracket,back=c.clevis(pt,n,off(pt,Y,-mm(42)))
+        c.put(bracket,key+' double-shear clevis')
+        anchor=(back[0],y,back[2]); rail=(back[0],y,z1 if key[0]=='U' else z0)
+        c.put(c.cyl(back,anchor,mm(14)),key+' stand-off')
+        c.put(c.cyl(anchor,rail,mm(14)),key+' rail riser')
+        c.ball_and_pin(pt,n,key)
+    rp=h['RP']; bracket,back=c.clevis(rp,X,off(rp,Z,-mm(45)),mm(32.2),mm(42),mm(6.1))
+    c.put(bracket,'Rocker pivot double-shear bracket')
+    c.put(c.cyl(back,(rp[0],y,z1),mm(18)),'Rocker triangulated pedestal')
+    c.put(c.ring(rp,X,mm(30.2),mm(10),mm(6.1)),'Rocker journal bush','steel')
+    c.put(c.cyl(off(rp,X,-mm(25)),off(rp,X,mm(25)),mm(6)),'Rocker M12 pivot','steel')
+    for sign in (-1,1):
+        c.put(c.cyl(off(rp,X,sign*mm(23)),off(rp,X,sign*mm(28)),mm(10)),
+              'Rocker pivot retainer '+str(sign),'steel')
+    pt=h['D']; bracket,back=c.clevis(pt,X,off(pt,Z,-mm(40)))
+    c.put(bracket,'Damper fixed-end clevis')
+    foot=(pt[0],pt[1],z1)
+    c.put(c.cyl(back,foot,mm(18)),'Damper tower')
+    c.put(c.cyl(back,(pt[0],y,z1),mm(14)),'Damper diagonal brace')
+    c.ball_and_pin(pt,X,'Damper chassis eye')
+    ti=h['TI']
+    c.put(c.cyl(off(ti,Y,-mm(180)),off(ti,Y,-mm(52)),mm(18)), 'Fixed steering rack housing proxy','alloy')
+    c.put(c.cyl(off(ti,Y,-mm(60)),off(ti,Y,-mm(28)),mm(8)), 'Rack output shaft proxy','steel')
+    c.finish(); occ.isGrounded=True
+
+
+def build_arm(c,p,h,q,which,name):
+    c.start(which,name,'arm',('Steel',))
+    a,b,o,af,br,j,n=arm_shape(h,q,which)
+    typ='upper' if which=='U' else 'lower'
+    da,db=unit(sub(j,af)),unit(sub(j,br))
+    plug_a=c.cyl(off(af,da,-mm(6)),off(af,da,mm(10)),p[typ+'_OD']/2)
+    plug_b=c.cyl(off(br,db,-mm(6)),off(br,db,mm(10)),p[typ+'_OD']/2)
+    body=c.union(c.eye_blank(a,n),c.cyl(a,af,mm(8)),plug_a,
+                 c.tube(af,j,p[typ+'_OD'],p[typ+'_wall']),
+                 c.sphere(j,p[typ+'_OD']/2+mm(1)),c.tube(br,j,p[typ+'_OD'],p[typ+'_wall']),
+                 plug_b,c.cyl(b,br,mm(8)),c.eye_blank(b,n),c.cyl(o,j,mm(8)),c.eye_blank(o,n))
+    for pt in (a,b,o): c.eye_cut(body,pt,n)
+    c.put(body,'Welded hollow '+typ+' wishbone with bearing sockets')
+    c.finish()
+
+
+def build_upright(c,p,q,r,n):
+    c.start('upright','04 Upright, steering arm and bearing cartridges','alloy',('Aluminum 7075', 'Aluminum 6061'))
+    hub=off(q['W'],n,-mm(70)); axis=rotvec(X,r)
+    body=c.cyl(off(hub,n,-mm(40)),off(hub,n,mm(40)),mm(60))
+    for key in ('U','L','T','P'):
+        pt=q[key]; d=sub(hub,pt); d=unit(sub(d,mul(axis,dot(d,axis))))
+        bracket,back=c.clevis(pt,axis,off(pt,d,mm(42)))
+        body=c.union(body,c.cyl(hub,back,mm(17)),bracket)
+    c.cut(body,c.cyl(off(hub,n,-mm(120)),off(hub,n,mm(120)),mm(45.15)))
+    c.put(body,'Upright carrier with bored bearing seats and four clevises')
+    for key in ('U','L','T','P'): c.ball_and_pin(q[key],axis,key+' upright pickup')
+    for sign in (-1,1):
+        ctr=off(hub,n,sign*mm(25))
+        c.put(c.ring(ctr,n,mm(16),mm(45),mm(28)), 'Sealed hub bearing '+str(sign),'steel')
+        c.put(c.ring(off(ctr,n,sign*mm(8.5)),n,mm(1),mm(44),mm(29)), 'Bearing seal '+str(sign),'rubber')
+    c.finish()
+
+
+def build_link(c,p,q,key,a,b,typ,name):
+    c.start(key,name,'arm',('Steel',))
+    pa,pb=q[a],q[b]; d=unit(sub(pb,pa))
+    # Narrow necks at both spherical housings, thick-walled central tube.
+    aa=off(pa,d,mm(32)); bb=off(pb,d,-mm(32))
+    body=c.union(c.eye_blank(pa,X),c.cyl(pa,aa,mm(7)),
+                 c.cyl(off(aa,d,-mm(5)),off(aa,d,mm(8)),p[typ+'_OD']/2),
+                 c.tube(aa,bb,p[typ+'_OD'],p[typ+'_wall']),
+                 c.cyl(off(bb,d,-mm(8)),off(bb,d,mm(5)),p[typ+'_OD']/2),
+                 c.cyl(bb,pb,mm(7)),c.eye_blank(pb,X))
+    c.eye_cut(body,pa,X); c.eye_cut(body,pb,X)
+    c.put(body,'Hollow '+typ+' with spherical outer races')
+    for pt in (off(aa,d,mm(10)),off(bb,d,-mm(10))):
+        c.put(c.ring(pt,d,mm(5),p[typ+'_OD']/2+mm(2),p[typ+'_OD']/2+mm(.05)),
+              'Adjustment lock collar '+str(round(pt[1]*1000)),'steel')
+    c.finish()
+
+
+def build_rocker(c,p,q):
+    c.start('rocker','06 Double-cheek inboard rocker','alloy',('Aluminum 7075','Aluminum 6061'))
+    rp,ri,ro=q['RP'],q['RI'],q['RO']
+    body=c.ring(rp,X,mm(30.2),mm(22),mm(10.1))
+    for sign in (-1,1):
+        shift=mul(X,sign*mm(12.1))
+        a,b,d=add(rp,shift),add(ri,shift),add(ro,shift)
+        plate=c.union(c.capsule(a,b,X,mm(28),mm(6)),
+                      c.capsule(a,d,X,mm(28),mm(6)),
+                      c.capsule(b,d,X,mm(24),mm(6)))
+        for pt,rad in ((rp,mm(10.1)),(ri,mm(5.1)),(ro,mm(5.1))):
+            c.cut(plate,c.cyl(off(pt,X,-mm(40)),off(pt,X,mm(40)),rad))
+        body=c.union(body,plate)
+    c.put(body,'Pocketed rocker cheek plates and pivot boss')
+    c.ball_and_pin(ri,X,'Rocker pushrod eye'); c.ball_and_pin(ro,X,'Rocker damper eye')
+    c.finish()
+
+
+def build_damper(c,p,q,wire):
+    a,b=q['D'],q['RO']; d=unit(sub(b,a)); length=distance(a,b)
+    c.start('damper','07 Damper body and lower spring seat','damper',('Aluminum 6061',))
+    eye=c.union(c.eye_blank(a,X),c.cyl(a,off(a,d,mm(30)),mm(8)))
+    c.eye_cut(eye,a,X); c.put(eye,'Damper body spherical eye')
+    barrel=c.cyl(off(a,d,mm(24)),off(a,d,mm(155)),mm(19))
+    c.cut(barrel,c.cyl(off(a,d,mm(60)),off(a,d,mm(156)),mm(8.1)))
+    c.put(barrel,'Bored damper barrel')
+    c.put(c.ring(off(a,d,mm(30)),d,mm(5),mm(36),mm(19)), 'Adjustable lower spring seat')
+    c.put(c.ring(off(a,d,mm(157.5)),d,mm(5),mm(21),mm(8.1)), 'Shaft gland','steel')
+    c.finish()
+    c.start('shaft','08 Damper shaft and upper spring seat','steel',('Steel',))
+    eye=c.union(c.eye_blank(b,X),c.cyl(off(b,d,-mm(30)),b,mm(8)))
+    c.eye_cut(eye,b,X); c.put(eye,'Damper shaft spherical eye')
+    c.put(c.cyl(off(b,d,-mm(160)),off(b,d,-mm(22)),mm(8)), 'Sliding damper shaft')
+    c.put(c.ring(off(b,d,-mm(30)),d,mm(5),mm(36),mm(8)), 'Upper spring seat','damper')
+    c.put(c.ring(off(b,d,-mm(52)),d,mm(20),mm(13),mm(8.05)), 'Progressive bump-stop proxy','rubber')
+    c.finish()
+    # Seat facing surfaces, then closed end-ring centres one wire radius inward.
+    start=off(a,d,mm(32.5)+wire/2); end=off(b,d,-mm(32.5)-wire/2)
+    make_spring(c,p,start,end,d,wire)
+
+
+def make_spring(c,p,a,b,d,wire):
+    occ=c.start('spring','09 Coil spring - regenerated with bump','spring',('Steel',))
+    radius=p['spring_mean_diameter']/2; turns=p['spring_turns']
+    span=distance(a,b); u=perpendicular(d); start=off(a,u,radius)
+    spring_ok=False
+    if TRY_HELICAL_SWEEP:
+        try:
+            helix=c.tm.createHelixWire(point(a),vector(d),point(start),100*span/turns,turns,0.)
+            if helix is None: raise RuntimeError('Helix creation returned null.')
+            edge=helix.edges.item(0); ev=edge.evaluator
+            ok,t0,t1=ev.getParameterExtents()
+            if not ok: raise RuntimeError('Cannot evaluate helix.')
+            ok,sp=ev.getPointAtParameter(t0); ok2,tangent=ev.getFirstDerivative(t0)
+            if not ok or not ok2: raise RuntimeError('Cannot evaluate helix tangent.')
+            tangent.normalize()
+            circle=adsk.core.Circle3D.createByCenter(sp,tangent,100*wire/2)
+            profile_wire,edge_map=c.tm.createWireFromCurves([circle])
+            face=c.tm.createFaceFromPlanarWires([profile_wire])
+            c.put(helix,'Spring construction helix'); c.put(face,'Spring sweep section')
+            feat=c.base; c.finish()
+            path_body=feat.bodies.item(0); section_body=feat.bodies.item(1)
+            path=occ.component.features.createPath(path_body.edges.item(0),False)
+            sweeps=occ.component.features.sweepFeatures
+            inp=sweeps.createInput(section_body.faces.item(0),path,
+                                  adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+            sweep=sweeps.add(inp); sweep.name='Continuous helical spring'
+            if sweep.bodies.count != 1: raise RuntimeError('Spring sweep did not make one body.')
+            spring=sweep.bodies.item(0); spring.name='Active helical spring turns'
+            if 'spring' in c.styles: spring.appearance=c.styles['spring']
+            path_body.isLightBulbOn=False; section_body.isLightBulbOn=False
+            spring_ok=True
+        except Exception as e:
+            WARNINGS.append('Helical sweep fallback used: '+str(e))
+            c.finish()
+            for body in occ.component.bRepBodies: body.isLightBulbOn=False
+    if not spring_ok:
+        c.finish()
+        # Robust continuous faceted helix fallback, not a stack of floating rings.
+        c.current=occ.component; c.names=[]; c.style='spring'
+        c.base=c.current.features.baseFeatures.add(); c.base.name='Segmented helix fallback'; c.base.startEdit()
+        v=unit(cross(d,u)); count=max(96,int(turns*24)); prev=None
+        for i in range(count+1):
+            theta=2*math.pi*turns*i/count
+            pos=add(off(a,d,span*i/count),
+                    add(mul(u,radius*math.cos(theta)),mul(v,radius*math.sin(theta))))
+            if prev is not None:
+                c.put(c.cyl(prev,pos,wire/2),'Spring wire segment %03d'%i)
+            c.put(c.sphere(pos,wire/2),'Spring wire junction %03d'%i)
+            prev=pos
+        c.finish()
+    c.current=occ.component; c.names=[]; c.style='spring'
+    c.base=c.current.features.baseFeatures.add(); c.base.name='Closed spring ends'; c.base.startEdit()
+    for i,pt in enumerate((a,b)):
+        ring=c.tm.createTorus(point(pt),vector(d),100*radius,100*wire/2)
+        c.put(ring,'Closed end coil '+str(i+1))
+    c.finish()
+
+
+def build_wheel(c,p,q,n):
+    w=q['W']; inside=p['rim_inside']; rr=p['rim_radius']; width=p['rim_width']
+    c.start('hub','11 Wheel hub, hollow spindle and drive flange','steel',('Steel',))
+    shaft=c.ring(off(w,n,mm(6)),n,mm(236),mm(27.8),mm(19))
+    flange=c.ring(off(w,n,mm(99)),n,mm(12),mm(72),mm(19))
+    c.put(c.union(shaft,flange),'Hollow hub spindle and outboard wheel flange')
+    c.put(c.ring(off(w,n,mm(121)),n,mm(16),mm(36),mm(28)), 'Centre-lock nut proxy')
+    radial=perpendicular(n); other=unit(cross(n,radial))
+    for i in range(6):
+        ang=2*math.pi*i/6; pcd=add(mul(radial,mm(53)*math.cos(ang)),mul(other,mm(53)*math.sin(ang)))
+        pt=add(off(w,n,mm(105)),pcd)
+        c.put(c.cyl(off(pt,n,-mm(5)),off(pt,n,mm(10)),mm(5)), 'Wheel drive pin '+str(i+1))
+    c.finish()
+    c.start('wheel','12 18-inch-style open-spoke wheel','alloy',('Aluminum 6061',))
+    body=c.ring(w,n,width,rr,inside)
+    for sign in (-1,1):
+        body=c.union(body,c.ring(off(w,n,sign*(width/2-mm(3))),n,mm(6),rr+mm(10),inside))
+    disk=off(w,n,mm(109))
+    for i in range(6):
+        angle=2*math.pi*i/6
+        v=add(mul(radial,math.cos(angle)),mul(other,math.sin(angle)))
+        body=c.union(body,c.capsule(off(disk,v,mm(60)),off(disk,v,inside+mm(2)),n,mm(27),mm(8)))
+    body=c.union(body,c.ring(disk,n,mm(8),mm(73),mm(28)))
+    # Actual drive-pin holes, rather than pins intersecting a solid wheel centre.
+    for i in range(6):
+        ang=2*math.pi*i/6
+        pt=add(disk,add(mul(radial,mm(53)*math.cos(ang)),mul(other,mm(53)*math.sin(ang))))
+        c.cut(body,c.cyl(off(pt,n,-mm(15)),off(pt,n,mm(15)),mm(5.15)))
+    c.put(body,'Barrel, rounded lips and six open spokes'); c.finish()
+    occ=c.start('tyre','13 Tyre clearance envelope - hide for detail','rubber',('Rubber',))
+    half=p['tyre_width']/2; shoulder=mm(35); radius=p['wheel_radius']
+    tire=c.cyl(off(w,n,-half+shoulder),off(w,n,half-shoulder),radius)
+    for sign in (-1,1):
+        tire=c.union(tire,c.cyl(off(w,n,sign*(half-shoulder)),off(w,n,sign*half),radius,radius-mm(20)))
+    c.cut(tire,c.cyl(off(w,n,-half-mm(1)),off(w,n,half+mm(1)),rr+mm(10)))
+    # Hollow carcass, with sidewalls and bead webs touching the rim lips.
+    cavity_end=width/2-mm(10)
+    cavity=c.cyl(off(w,n,-cavity_end),off(w,n,cavity_end),radius-mm(12))
+    for sign in (-1,1):
+        cavity=c.union(cavity,c.cyl(off(w,n,sign*cavity_end),
+            off(w,n,sign*(half-mm(8))),radius-mm(12),radius-mm(40)))
+    c.cut(tire,cavity)
+    for sign in (-1,1):
+        a=off(w,n,sign*(width/2-mm(3))); b=off(w,n,sign*(half-mm(6)))
+        web=c.cut(c.cyl(a,b,rr+mm(18),radius-mm(32)),
+                  c.cyl(a,b,rr+mm(10),radius-mm(40)))
+        tire=c.union(tire,web,c.ring(a,n,mm(8),rr+mm(20),rr+mm(10)))
+    c.put(tire,'Hollow tyre carcass, sidewalls and bead seats'); c.finish()
+    if TRANSLUCENT_TYRE:
+        try: occ.component.opacity=.20
+        except Exception: WARNINGS.append('Set tyre component opacity manually to 20%.')
+
+
+def sketch_anchor(occ,p,n=None,name='Joint datum'):
+    comp=occ.component
+    # Offset XY plane keeps the point unambiguously on a 2D sketch plane.
+    ci=comp.constructionPlanes.createInput()
+    ci.setByOffset(comp.xYConstructionPlane,adsk.core.ValueInput.createByReal(100*p[2]))
+    plane=comp.constructionPlanes.add(ci); plane.name=name+' plane'
+    sketch=comp.sketches.add(plane); sketch.name=name
+    sp=sketch.sketchPoints.add(sketch.modelToSketchSpace(point(p)))
+    sketch.isLightBulbOn=False; plane.isLightBulbOn=False
+    proxy=sp.createForAssemblyContext(occ)
+    axis=None
+    if n is not None:
+        # Use a 3D construction line; the second datum uses its own offset plane.
+        pp=off(p,n,mm(30)); cp=comp.constructionPlanes.createInput()
+        cp.setByOffset(comp.xYConstructionPlane,adsk.core.ValueInput.createByReal(100*pp[2]))
+        pl=comp.constructionPlanes.add(cp); pl.name=name+' axis end plane'
+        sk=comp.sketches.add(pl); sk.name=name+' axis end'
+        sp2=sk.sketchPoints.add(sk.modelToSketchSpace(point(pp)))
+        ai=comp.constructionAxes.createInput(); ai.setByTwoPoints(sp,sp2)
+        axis=comp.constructionAxes.add(ai); axis.name=name+' axis'
+        axis.isLightBulbOn=False; sk.isLightBulbOn=False; pl.isLightBulbOn=False
+        axis=axis.createForAssemblyContext(occ)
+    return adsk.fusion.JointGeometry.createByPoint(proxy),axis
+
+
+def add_joints(c,h,q,n):
+    if not CREATE_NATIVE_JOINTS: return
+    dirs=adsk.fusion.JointDirections
+    specs=[
+        ('Upper inner pivot','U','chassis','rev','UF',unit(sub(h['UR'],h['UF']))),
+        ('Lower inner pivot','L','chassis','rev','LF',unit(sub(h['LR'],h['LF']))),
+        ('Upper outer spherical','upright','U','ball','U',None),
+        ('Lower outer spherical','upright','L','ball','L',None),
+        ('Tie inner spherical','tie','chassis','ball','TI',None),
+        ('Tie outer spherical','tie','upright','ball','T',None),
+        ('Rocker pivot','rocker','chassis','rev','RP',X),
+        ('Pushrod lower spherical','pushrod','upright','ball','P',None),
+        ('Pushrod upper spherical','pushrod','rocker','ball','RI',None),
+        ('Damper fixed spherical','damper','chassis','ball','D',None),
+        ('Damper sliding shaft','shaft','damper','cyl','D',unit(sub(q['RO'],q['D']))),
+        ('Damper rocker spherical','shaft','rocker','ball','RO',None),
+        ('Wheel bearing rotation','hub','upright','rev','W',n),
+        ('Wheel flange','wheel','hub','rigid','W',None),
+        ('Tyre bead attachment','tyre','wheel','rigid','W',None),
+        ('Spring visual attachment','spring','damper','rigid','D',None),
+    ]
+    for name,a,b,kind,key,direction in specs:
+        try:
+            geometry,axis=(None,None) if kind=='rigid' else sketch_anchor(c.parts[a],q[key],direction,name)
+            ji=c.root.asBuiltJoints.createInput(c.parts[a],c.parts[b],geometry)
+            if kind=='rev': ok=ji.setAsRevoluteJointMotion(dirs.CustomJointDirection,axis)
+            elif kind=='cyl': ok=ji.setAsCylindricalJointMotion(dirs.CustomJointDirection,axis)
+            elif kind=='ball': ok=ji.setAsBallJointMotion(dirs.ZAxisJointDirection,dirs.XAxisJointDirection)
+            else: ok=ji.setAsRigidJointMotion()
+            if not ok: raise RuntimeError('Joint motion definition rejected.')
+            jt=c.root.asBuiltJoints.add(ji)
+            if not jt: raise RuntimeError('Joint creation returned null.')
+            jt.name=name
+        except Exception as e:
+            WARNINGS.append('Native joint '+name+': '+str(e))
+    # The coil is a visual solid, not a deformable solver element. Use fl_bump.
+
+
+def references(c,p,h,q):
+    occ=c.root.occurrences.addNewComponent(adsk.core.Matrix3D.create())
+    occ.component.name='00 Hard points - construction reference'
+    for key,pt in q.items():
+        comp=occ.component; inp=comp.constructionPlanes.createInput()
+        inp.setByOffset(comp.xYConstructionPlane,adsk.core.ValueInput.createByReal(100*pt[2]))
+        plane=comp.constructionPlanes.add(inp); plane.name=key+' Z datum'; plane.isLightBulbOn=False
+        sk=comp.sketches.add(plane); sk.name=key+' = (%.3f, %.3f, %.3f) mm'%tuple(1000*x for x in pt)
+        sk.sketchPoints.add(sk.modelToSketchSpace(point(pt))); sk.isLightBulbOn=False
+    occ.isLightBulbOn=False
+
+
+def report(p,h,rows,mr,wire,clearance,barrel,mass):
+    kw=p['spring_N_per_mm']*mr*mr; freq=math.sqrt(kw*1000/mass)/(2*math.pi)
+    slope_u=(h['UR'][2]-h['UF'][2])/(h['UR'][0]-h['UF'][0])
+    slope_l=(h['LR'][2]-h['LF'][2])/(h['LR'][0]-h['LF'][0])
+    anti=-.5*(slope_u+slope_l)*p['wheelbase']/p['cg_height']*p['front_brake_fraction']*100
+    text=('FLCornerV1 - CONCEPT, NOT STRUCTURAL CERTIFICATION\n'
+          'Motion ratio = spring compression / upward wheel travel.\n'
+          'Static motion ratio: %.5f\nSpring rate: %.2f N/mm\nWheel rate: %.2f N/mm\n'
+          'Assumed sprung corner mass: %.2f kg\nUndamped ride frequency: %.3f Hz\n'
+          'Calculated spring wire diameter (G=79 GPa): %.3f mm\n'
+          'Approximate parallel-axis anti-dive: %.2f %%\n'
+          'Sampled non-connected link clearance: %.2f mm\n'
+          'Sampled link-to-barrel radial clearance: %.2f mm\n'
+          'Clearance checks are limited centreline-envelope checks, NOT a full collision certification.\n'
+          'Anti-dive estimate assumes parallel inner hinge axes and outboard front brakes.\n'
+          'No tyre stiffness, chassis compliance, damping, aero map or structural FEA is included.\n'
+          'Native joints do not deform the coil: use fl_bump and rerun.\n\n') % (
+              mr,p['spring_N_per_mm'],kw,mass,freq,wire*1000,anti,clearance*1000,barrel*1000)
+    text+='Bump_mm, Camber_deg, ToeIn_deg, Heave_RC_mm, DamperLength_mm, Rocker_deg\n'
+    for row in rows:
+        text+='%.3f, %.5f, %.5f, %.3f, %.3f, %.3f\n'%(row[0]*1000,
+            math.degrees(row[1]),math.degrees(row[2]),row[3]*1000,row[4]*1000,math.degrees(row[5]))
+    if WARNINGS: text+='\nWARNINGS:\n'+'\n'.join(WARNINGS)+'\n'
+    folder=os.path.join(os.path.expanduser('~'),'Downloads','FLCornerV1_reports')
+    try:
+        os.makedirs(folder,exist_ok=True)
+        with open(os.path.join(folder,'engineering_report.txt'),'w',encoding='utf-8') as f: f.write(text)
+        with open(os.path.join(folder,'hardpoints_static_mm.csv'),'w',newline='',encoding='utf-8') as f:
+            wr=csv.writer(f); wr.writerow(['Point','X_mm','Y_mm','Z_mm'])
+            for key,pt in h.items(): wr.writerow([key]+[round(v*1000,6) for v in pt])
+    except Exception as e:
+        WARNINGS.append('Could not write report files: '+str(e)); folder='Report file unavailable; see Text Commands.'
+    try:
+        pal=adsk.core.Application.get().userInterface.palettes.itemById('TextCommands')
+        if pal: pal.writeText(text)
+    except Exception: pass
+    return folder
+
+
+def run(context):
+    global WARNINGS
+    WARNINGS=[]; app=adsk.core.Application.get(); ui=app.userInterface; cad=None
+    try:
+        design,p=read_parameters(app); h=hardpoints(p)
+        checks=validate(p,h); rows,mr,wire,clearance,barrel,mass=checks
+        q,r=solve_pose(h,p['bump']); solve_rocker(h,q); n=axle(p,r)
+        cad=CAD(design)
+        build_chassis(cad,p,h)
+        build_arm(cad,p,h,q,'U','02 Upper wishbone')
+        build_arm(cad,p,h,q,'L','03 Lower wishbone')
+        build_upright(cad,p,q,r,n)
+        build_link(cad,p,q,'pushrod','P','RI','pushrod','05 Pushrod')
+        build_rocker(cad,p,q)
+        build_damper(cad,p,q,wire)
+        build_link(cad,p,q,'tie','TI','T','tie','10 Steering tie rod')
+        build_wheel(cad,p,q,n)
+        references(cad,p,h,q); add_joints(cad,h,q,n)
+        for name,value,units in (('mr_actual',mr,''),('wheel_rate_N_per_mm',p['spring_N_per_mm']*mr*mr,'')):
+            design.userParameters.add('fl_'+name,adsk.core.ValueInput.createByReal(value),units,
+                                      'Calculated OUTPUT; overwritten in the next generated design.')
+        cam=app.activeViewport.camera
+        cam.eye=point((1.7,-1.2,1.2)); cam.target=point((0.,.55,.36)); cam.upVector=vector(Z)
+        cam.isFitView=True; app.activeViewport.camera=cam; app.activeViewport.fit(); app.activeViewport.refresh()
+        folder=report(p,h,rows,mr,wire,clearance,barrel,mass)
+        msg=('Front-left suspension generated.\n\nBump: %.1f mm\nMotion ratio: %.3f\n'
+             'Wheel rate: %.1f N/mm\n\nReport: %s\n\n'
+             'Save this design. To change geometry: Modify > Change Parameters, edit fl_* and rerun.\n'
+             'Rerunning creates a NEW updated design and preserves this one.')%(
+                 p['bump']*1000,mr,p['spring_N_per_mm']*mr*mr,folder)
+        if WARNINGS: msg+='\n\nWarnings (%d):\n'%len(WARNINGS)+'\n'.join(WARNINGS[:5])
+        ui.messageBox(msg,TAG)
+    except Exception:
+        try:
+            if cad: cad.finish()
+        except Exception: pass
+        ui.messageBox('Build stopped. The incomplete design is left open for inspection.\n\n'+
+                      traceback.format_exc(),TAG+' error')
+
+
+def stop(context):
+    pass
